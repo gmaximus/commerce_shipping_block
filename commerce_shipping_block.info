@@ -1,0 +1,5 @@
+name = Commerce Shipping Block
+description = Defines a form in a block for estimating shipping by country.
+dependencies[] = commerce_shipping
+package = Commerce (contrib)
+core = 7.x

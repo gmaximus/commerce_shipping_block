@@ -1,0 +1,615 @@
+<?php
+/**
+ * @file
+ * Defines a form in a block for estimating items like taxes and shipping rates
+ * on the cart form.
+ */
+
+
+/**
+ * Implements hook_block_info().
+ */
+function commerce_shipping_block_block_info() {
+  $blocks = array();
+
+  $blocks['cart_estimate_form'] = array(
+    'info' => t('Shipping quote form'),
+    'cache' => DRUPAL_NO_CACHE,
+    'status' => 0,
+    'visibility' => BLOCK_VISIBILITY_LISTED,
+    'pages' => 'cart',
+  );
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_configure().
+ */
+function commerce_shipping_block_block_configure($delta = '') {
+  $form = array();
+
+  if ($delta == 'cart_estimate_form') {
+    $options = array();
+
+    if (module_exists('commerce_shipping')) {
+      $options['shipping'] = t('Shipping rates');
+    }
+
+    if (!empty($options)) {
+      $form['commerce_shipping_block_items'] = array(
+        '#type' => 'checkboxes',
+        '#title' => t('Items to estimate through this form'),
+        '#options' => array(
+          'shipping' => t('Shipping'),
+        ),
+        '#default_value' => variable_get('commerce_shipping_block_items', array()),
+      );
+    }
+    else {
+      $form['commerce_shipping_block_items'] = array(
+        '#type' => 'markup',
+        '#markup' => '<div class="messages warning">' . t('There are no module enabled providing items to estimate.') . '</div>',
+      );
+    }
+    
+    $form['commerce_shipping_block_form_orientation'] = array(
+      '#type' => 'radios',
+      '#title' => t('Estimate form orientation'),
+      '#options' => array(
+        'horizontal' => t('Horizontal'),
+        'vertical' => t('Vertical'),
+      ),
+      '#default_value' => commerce_shipping_block_get_form_orientation(),
+    );
+    
+    $text_above_form = variable_get('commerce_shipping_block_text_above_form', array('value' => '', 'format' => NULL));
+    $form['commerce_shipping_block_text_above_form'] = array(
+      '#type' => 'text_format',
+      '#title' => t('Text above form'),
+      '#default_value' => $text_above_form['value'],
+      '#format' => $text_above_form['format'],
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Implements hook_block_save().
+ */
+function commerce_shipping_block_block_save($delta = '', $edit = array()) {
+  if ($delta == 'cart_estimate_form') {
+    variable_set('commerce_shipping_block_items', $edit['commerce_shipping_block_items']);
+    variable_set('commerce_shipping_block_form_orientation', $edit['commerce_shipping_block_form_orientation']);
+    variable_set('commerce_shipping_block_text_above_form', $edit['commerce_shipping_block_text_above_form']);
+  }
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function commerce_shipping_block_block_view($delta = '') {
+  if ($delta == 'cart_estimate_form') {
+    // Check to ensure the form is configured to estimate items.
+    if (commerce_shipping_block_get_estimate_items() != array()) {
+      global $user;
+
+      // Load the current cart order.
+      $order = commerce_cart_order_load($user->uid);
+
+      // Do not render the block if the customer does not have a cart.
+      if (empty($order)) {
+        return;
+      }
+
+      // Do not render the block if the cart is empty.
+      $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+      $quantity = commerce_line_items_quantity($order_wrapper->commerce_line_items, commerce_product_line_item_types());
+
+      if ($quantity == 0) {
+        return;
+      }
+      $text_above_form = variable_get('commerce_shipping_block_text_above_form', array('value' => '', 'format' => NULL));
+      $shipping_form = drupal_get_form('commerce_shipping_block_form', $order);
+      $block['subject'] = commerce_shipping_block_block_subject();
+      $block['content'] = $text_above_form['value'];
+      $block['content'] .= drupal_render($shipping_form);
+
+      return $block;
+    }
+  }
+}
+
+/**
+ * Form callback: builds the cart estimate form.
+ *
+ * @param $form
+ *   The initialized form array.
+ * @param $form_state
+ *   The form state array.
+ * @param $order
+ *   The order object that should have items estimated.
+ */
+function commerce_shipping_block_form($form, &$form_state, $order) {
+  // Add the module's CSS if the form should be horizontally aligned.
+  if (commerce_shipping_block_get_form_orientation() == 'horizontal') {
+    $form['#attached']['css'][] = drupal_get_path('module', 'commerce_shipping_block') . '/theme/commerce_shipping_block.theme.css';
+  }
+
+  $form['#attributes']['class'][] = 'commerce-cart-estimate-form';
+
+  $form['order_id'] = array(
+    '#type' => 'value',
+    '#value' => $order->order_id,
+  );
+
+ 
+
+  $form['country'] = array(
+    '#title' => t('Country'),
+    '#type' => 'select',
+    '#options' => commerce_shipping_block_get_available_countries(),
+    '#empty_option' => t('- Select one -'),
+    '#ajax' => array(
+      'callback' => 'commerce_shipping_block_onchange_refresh',
+      'wrapper' => 'cart-estimate-display',
+    ),
+  );
+
+
+  // If the order has a shipping address, set default values for the elements.
+  if (!empty($order->commerce_customer_shipping)) {
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+    try {
+      $form['country']['#default_value'] = $order_wrapper->commerce_customer_shipping->commerce_customer_address->country->value();
+    }
+    catch (Exception $e) {
+      // Catch any exceptions related to missing properties.
+    }
+  }
+
+  $form['submit'] = array(
+    '#type' => 'button',
+    '#value' => t('Get Quote'),
+    '#ajax' => array(
+      'callback' => 'commerce_shipping_block_refresh',
+      'wrapper' => 'cart-estimate-display',
+    ),
+  );
+
+  // Prepare the output for the cart estimate display field.
+  $items = array();
+  $output = '';
+
+  if (!empty($form_state['values'])) {
+    // First ensure we have the necessary address components.
+    if (empty($form_state['values']['country'])) {
+     $items[] = t('You must select a country.');
+    }
+
+    // If we didn't get any error messages...
+    if (empty($items)) {
+      $estimate_items = commerce_shipping_block_get_estimate_items();
+      $output = '';
+
+      // Build the item list for the estimated shipping rates if enabled.
+      if (in_array('shipping', $estimate_items)) {
+        $items = commerce_shipping_block_rates($order, $form_state['values']['country']);
+
+        if (empty($items)) {
+          $output .= theme('item_list', array(
+            'items' => array(t('No rates could not be estimated at this time.')),
+            'title' => t('Estimated shipping rates:')
+          ));
+          
+        }
+        else {
+          $output .= theme('item_list', array(
+            'items' => $items,
+            'title' => format_plural(count($items), 'Your shipping quote:', 'Your shipping quotes:'),
+          ));
+          $output .= '<a href="/checkout" class="btn btn-default commerce-shipping-block-checkout">Checkout</a>';
+        }
+      }
+    }
+    else {
+      // Otherwise just theme the error messages.
+      $output = theme('item_list', array(
+        'items' => $items,
+        'title' => format_plural(count($items), 'There was an error estimating shipping:', 'There were errors estimating shipping:'),
+      ));
+    }
+  }
+
+  $form['cart_estimate_display'] = array(
+    '#type' => 'markup',
+    '#prefix' => '<div id="cart-estimate-display" class="cart-estimate-display">',
+    '#markup' => $output,
+    '#suffix' => '</div>',
+  );
+
+  return $form;
+}
+
+/**
+ * Form callback: refreshes the cart estimate form.
+ */
+function commerce_shipping_block_refresh($form, &$form_state) {
+  return $form['cart_estimate_display'];
+}
+
+/**
+ * Form callback: refreshes the cart estimate via onchange events.
+ */
+function commerce_shipping_block_onchange_refresh($form, &$form_state) {
+  // Only return the onchange refresh value if we have all required fields.
+  if (!empty($form_state['values']['country'])) {
+    return $form['cart_estimate_display'];
+  }
+}
+
+/**
+ * Returns an array of items to be estimated in the cart estimate form.
+ */
+function commerce_shipping_block_get_estimate_items() {
+  $estimate_items = array();
+
+  foreach (variable_get('commerce_shipping_block_items', array()) as $key => $value) {
+    if (!empty($key) && $key === $value) {
+      $estimate_items[] = $key;
+    }
+  }
+
+  return $estimate_items;
+}
+
+/**
+ * Returns the orientation of the cart estimate form.
+ */
+function commerce_shipping_block_get_form_orientation() {
+  return variable_get('commerce_shipping_block_form_orientation', 'horizontal');
+}
+
+/**
+ * Returns the subject to use for the cart estimate block based on the enabled
+ * estimate items.
+ */
+function commerce_shipping_block_block_subject() {
+  $estimate_items = commerce_shipping_block_get_estimate_items();
+
+  if (in_array('shipping', $estimate_items)) {
+    $subject = t('Estimate your shipping');
+  }
+
+  return $subject;
+}
+
+/**
+ * Returns an array of estimated shipping rates for presentation in a themed
+ * item list.
+ *
+ * @param $order
+ *   The order to estimate shipping rates for.
+ * @param $administrative_area
+ *   The administrative area to set on the order.
+ * @param $postal_code
+ *   The postal code to set on the order.
+ *
+ * @return string[]
+ *   An array of strings designed to be themed as an item list.
+ */
+function commerce_shipping_block_rates($order, $country) {
+  
+  // Retain a local clone of the order.
+  $previous_order = clone($order);
+
+  // Create temporary billing and shipping customer profiles.
+  $billing_profile = commerce_customer_profile_new('billing', $order->uid);
+  $shipping_profile = commerce_customer_profile_new('shipping', $order->uid);
+
+  $address_stub = array(
+    'country' => $country,
+  );
+
+  $billing_profile->commerce_customer_address = array(LANGUAGE_NONE => array(0 => $address_stub));
+  $shipping_profile->commerce_customer_address = array(LANGUAGE_NONE => array(0 => $address_stub));
+
+  commerce_customer_profile_save($billing_profile);
+  commerce_customer_profile_save($shipping_profile);
+
+  // Temporarily set the shipping and billing profiles on the order object.
+  $order->commerce_customer_billing[LANGUAGE_NONE][0]['profile_id'] = $billing_profile->profile_id;
+  $order->commerce_customer_shipping[LANGUAGE_NONE][0]['profile_id'] = $shipping_profile->profile_id;
+  commerce_order_save($order);
+
+  // Collect shipping rates for the order.
+  try {
+    commerce_shipping_collect_rates($order);
+    $form_state = array();
+
+    $shipping_options = commerce_shipping_service_rate_options($order, $form_state);
+  }
+  catch (Exception $e) {
+    // Catch any exceptions related to missing properties.
+  }
+
+  // Return the order to its previous state and delete the customer profiles.
+  commerce_order_save($previous_order);
+
+  commerce_customer_profile_delete($billing_profile->profile_id);
+  commerce_customer_profile_delete($shipping_profile->profile_id);
+
+  return !empty($shipping_options) ? $shipping_options : array();
+}
+
+function commerce_shipping_block_get_available_countries () {
+    
+    $instance = field_info_instance('commerce_customer_profile', 'commerce_customer_address', 'shipping');
+    $shipping_field_countries = $instance['widget']['settings']['available_countries'];
+    foreach ($shipping_field_countries as $shipping_field_country) {
+        $available_countries[$shipping_field_country] = commerce_shipping_block_code_to_country($shipping_field_country);
+    }
+    
+    // Sort the assoc array by values
+    asort($available_countries);
+    return $available_countries;
+}
+
+function commerce_shipping_block_code_to_country($code) {
+
+    $code = strtoupper($code);
+
+    $countryList = array(
+        'AF' => 'Afghanistan',
+        'AX' => 'Aland Islands',
+        'AL' => 'Albania',
+        'DZ' => 'Algeria',
+        'AS' => 'American Samoa',
+        'AD' => 'Andorra',
+        'AO' => 'Angola',
+        'AI' => 'Anguilla',
+        'AQ' => 'Antarctica',
+        'AG' => 'Antigua and Barbuda',
+        'AR' => 'Argentina',
+        'AM' => 'Armenia',
+        'AW' => 'Aruba',
+        'AU' => 'Australia',
+        'AT' => 'Austria',
+        'AZ' => 'Azerbaijan',
+        'BS' => 'Bahamas the',
+        'BH' => 'Bahrain',
+        'BD' => 'Bangladesh',
+        'BB' => 'Barbados',
+        'BY' => 'Belarus',
+        'BE' => 'Belgium',
+        'BZ' => 'Belize',
+        'BJ' => 'Benin',
+        'BM' => 'Bermuda',
+        'BT' => 'Bhutan',
+        'BO' => 'Bolivia',
+        'BA' => 'Bosnia and Herzegovina',
+        'BW' => 'Botswana',
+        'BV' => 'Bouvet Island (Bouvetoya)',
+        'BR' => 'Brazil',
+        'IO' => 'British Indian Ocean Territory (Chagos Archipelago)',
+        'VG' => 'British Virgin Islands',
+        'BN' => 'Brunei Darussalam',
+        'BG' => 'Bulgaria',
+        'BF' => 'Burkina Faso',
+        'BI' => 'Burundi',
+        'KH' => 'Cambodia',
+        'CM' => 'Cameroon',
+        'CA' => 'Canada',
+        'CV' => 'Cape Verde',
+        'KY' => 'Cayman Islands',
+        'CF' => 'Central African Republic',
+        'TD' => 'Chad',
+        'CL' => 'Chile',
+        'CN' => 'China',
+        'CX' => 'Christmas Island',
+        'CC' => 'Cocos (Keeling) Islands',
+        'CO' => 'Colombia',
+        'KM' => 'Comoros the',
+        'CD' => 'Congo',
+        'CG' => 'Congo the',
+        'CK' => 'Cook Islands',
+        'CR' => 'Costa Rica',
+        'CI' => 'Cote d\'Ivoire',
+        'HR' => 'Croatia',
+        'CU' => 'Cuba',
+        'CY' => 'Cyprus',
+        'CZ' => 'Czech Republic',
+        'DK' => 'Denmark',
+        'DJ' => 'Djibouti',
+        'DM' => 'Dominica',
+        'DO' => 'Dominican Republic',
+        'EC' => 'Ecuador',
+        'EG' => 'Egypt',
+        'SV' => 'El Salvador',
+        'GQ' => 'Equatorial Guinea',
+        'ER' => 'Eritrea',
+        'EE' => 'Estonia',
+        'ET' => 'Ethiopia',
+        'FO' => 'Faroe Islands',
+        'FK' => 'Falkland Islands (Malvinas)',
+        'FJ' => 'Fiji the Fiji Islands',
+        'FI' => 'Finland',
+        'FR' => 'France, French Republic',
+        'GF' => 'French Guiana',
+        'PF' => 'French Polynesia',
+        'TF' => 'French Southern Territories',
+        'GA' => 'Gabon',
+        'GM' => 'Gambia the',
+        'GE' => 'Georgia',
+        'DE' => 'Germany',
+        'GH' => 'Ghana',
+        'GI' => 'Gibraltar',
+        'GR' => 'Greece',
+        'GL' => 'Greenland',
+        'GD' => 'Grenada',
+        'GP' => 'Guadeloupe',
+        'GU' => 'Guam',
+        'GT' => 'Guatemala',
+        'GG' => 'Guernsey',
+        'GN' => 'Guinea',
+        'GW' => 'Guinea-Bissau',
+        'GY' => 'Guyana',
+        'HT' => 'Haiti',
+        'HM' => 'Heard Island and McDonald Islands',
+        'VA' => 'Holy See (Vatican City State)',
+        'HN' => 'Honduras',
+        'HK' => 'Hong Kong',
+        'HU' => 'Hungary',
+        'IS' => 'Iceland',
+        'IN' => 'India',
+        'ID' => 'Indonesia',
+        'IR' => 'Iran',
+        'IQ' => 'Iraq',
+        'IE' => 'Ireland',
+        'IM' => 'Isle of Man',
+        'IL' => 'Israel',
+        'IT' => 'Italy',
+        'JM' => 'Jamaica',
+        'JP' => 'Japan',
+        'JE' => 'Jersey',
+        'JO' => 'Jordan',
+        'KZ' => 'Kazakhstan',
+        'KE' => 'Kenya',
+        'KI' => 'Kiribati',
+        'KP' => 'Korea',
+        'KR' => 'Korea',
+        'KW' => 'Kuwait',
+        'KG' => 'Kyrgyz Republic',
+        'LA' => 'Lao',
+        'LV' => 'Latvia',
+        'LB' => 'Lebanon',
+        'LS' => 'Lesotho',
+        'LR' => 'Liberia',
+        'LY' => 'Libyan Arab Jamahiriya',
+        'LI' => 'Liechtenstein',
+        'LT' => 'Lithuania',
+        'LU' => 'Luxembourg',
+        'MO' => 'Macao',
+        'MK' => 'Macedonia',
+        'MG' => 'Madagascar',
+        'MW' => 'Malawi',
+        'MY' => 'Malaysia',
+        'MV' => 'Maldives',
+        'ML' => 'Mali',
+        'MT' => 'Malta',
+        'MH' => 'Marshall Islands',
+        'MQ' => 'Martinique',
+        'MR' => 'Mauritania',
+        'MU' => 'Mauritius',
+        'YT' => 'Mayotte',
+        'MX' => 'Mexico',
+        'FM' => 'Micronesia',
+        'MD' => 'Moldova',
+        'MC' => 'Monaco',
+        'MN' => 'Mongolia',
+        'ME' => 'Montenegro',
+        'MS' => 'Montserrat',
+        'MA' => 'Morocco',
+        'MZ' => 'Mozambique',
+        'MM' => 'Myanmar',
+        'NA' => 'Namibia',
+        'NR' => 'Nauru',
+        'NP' => 'Nepal',
+        'AN' => 'Netherlands Antilles',
+        'NL' => 'Netherlands the',
+        'NC' => 'New Caledonia',
+        'NZ' => 'New Zealand',
+        'NI' => 'Nicaragua',
+        'NE' => 'Niger',
+        'NG' => 'Nigeria',
+        'NU' => 'Niue',
+        'NF' => 'Norfolk Island',
+        'MP' => 'Northern Mariana Islands',
+        'NO' => 'Norway',
+        'OM' => 'Oman',
+        'PK' => 'Pakistan',
+        'PW' => 'Palau',
+        'PS' => 'Palestinian Territory',
+        'PA' => 'Panama',
+        'PG' => 'Papua New Guinea',
+        'PY' => 'Paraguay',
+        'PE' => 'Peru',
+        'PH' => 'Philippines',
+        'PN' => 'Pitcairn Islands',
+        'PL' => 'Poland',
+        'PT' => 'Portugal, Portuguese Republic',
+        'PR' => 'Puerto Rico',
+        'QA' => 'Qatar',
+        'RE' => 'Reunion',
+        'RO' => 'Romania',
+        'RU' => 'Russian Federation',
+        'RW' => 'Rwanda',
+        'BL' => 'Saint Barthelemy',
+        'SH' => 'Saint Helena',
+        'KN' => 'Saint Kitts and Nevis',
+        'LC' => 'Saint Lucia',
+        'MF' => 'Saint Martin',
+        'PM' => 'Saint Pierre and Miquelon',
+        'VC' => 'Saint Vincent and the Grenadines',
+        'WS' => 'Samoa',
+        'SM' => 'San Marino',
+        'ST' => 'Sao Tome and Principe',
+        'SA' => 'Saudi Arabia',
+        'SN' => 'Senegal',
+        'RS' => 'Serbia',
+        'SC' => 'Seychelles',
+        'SL' => 'Sierra Leone',
+        'SG' => 'Singapore',
+        'SK' => 'Slovakia (Slovak Republic)',
+        'SI' => 'Slovenia',
+        'SB' => 'Solomon Islands',
+        'SO' => 'Somalia, Somali Republic',
+        'ZA' => 'South Africa',
+        'GS' => 'South Georgia and the South Sandwich Islands',
+        'ES' => 'Spain',
+        'LK' => 'Sri Lanka',
+        'SD' => 'Sudan',
+        'SR' => 'Suriname',
+        'SJ' => 'Svalbard & Jan Mayen Islands',
+        'SZ' => 'Swaziland',
+        'SE' => 'Sweden',
+        'CH' => 'Switzerland, Swiss Confederation',
+        'SY' => 'Syrian Arab Republic',
+        'TW' => 'Taiwan',
+        'TJ' => 'Tajikistan',
+        'TZ' => 'Tanzania',
+        'TH' => 'Thailand',
+        'TL' => 'Timor-Leste',
+        'TG' => 'Togo',
+        'TK' => 'Tokelau',
+        'TO' => 'Tonga',
+        'TT' => 'Trinidad and Tobago',
+        'TN' => 'Tunisia',
+        'TR' => 'Turkey',
+        'TM' => 'Turkmenistan',
+        'TC' => 'Turks and Caicos Islands',
+        'TV' => 'Tuvalu',
+        'UG' => 'Uganda',
+        'UA' => 'Ukraine',
+        'AE' => 'United Arab Emirates',
+        'GB' => 'United Kingdom',
+        'US' => 'USA',
+        'UM' => 'United States Minor Outlying Islands',
+        'VI' => 'United States Virgin Islands',
+        'UY' => 'Uruguay, Eastern Republic of',
+        'UZ' => 'Uzbekistan',
+        'VU' => 'Vanuatu',
+        'VE' => 'Venezuela',
+        'VN' => 'Vietnam',
+        'WF' => 'Wallis and Futuna',
+        'EH' => 'Western Sahara',
+        'YE' => 'Yemen',
+        'ZM' => 'Zambia',
+        'ZW' => 'Zimbabwe'
+    );
+
+    if( !$countryList[$code] ) return $code;
+    else return $countryList[$code];
+    }
